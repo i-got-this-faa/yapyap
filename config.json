@@ -1,0 +1,8 @@
+{
+  "instance_name": "YapYap",
+  "host": "0.0.0.0",
+  "port": 8080,
+  "jwt_secret": "Use-Your-Own-Secret-FCS",
+  "postgres_url": "postgres://postgres:postgres@db:5432/yapyap?sslmode=disable",
+  "permission_cache_sync_seconds": 300
+}

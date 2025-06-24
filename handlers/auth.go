@@ -3,19 +3,17 @@ package yapyap
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	yapyapModels "yapyap/models"
 
+	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
-
-// JWT secret key - in production, this should come from environment variables
 
 type AuthRequest struct {
 	Username string `json:"username"`
@@ -23,8 +21,8 @@ type AuthRequest struct {
 }
 
 type AuthResponse struct {
-	UserID uint64            `json:"user_id"`
-	Token  string            `json:"token"` // JWT token
+	UserID uint              `json:"user_id"`
+	Token  string            `json:"token"`
 	User   yapyapModels.User `json:"user"`
 }
 
@@ -35,7 +33,7 @@ type RegisterRequest struct {
 }
 
 type Claims struct {
-	UserID   uint64 `json:"user_id"`
+	UserID   uint   `json:"user_id"`
 	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
@@ -48,12 +46,11 @@ func HashPassword(password string) (string, error) {
 
 // CheckPasswordHash compares a password with its hash
 func CheckPasswordHash(password, hash string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	return err == nil
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
 // GenerateJWT creates a new JWT token for a user
-func GenerateJWT(userID uint64, username string, jwtSecret []byte) (string, error) {
+func GenerateJWT(userID uint, username string, jwtSecret []byte) (string, error) {
 	claims := Claims{
 		UserID:   userID,
 		Username: username,
@@ -71,7 +68,7 @@ func GenerateJWT(userID uint64, username string, jwtSecret []byte) (string, erro
 func ValidateJWT(tokenString string, jwtSecret []byte) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			return nil, jwt.ErrTokenMalformed
 		}
 		return jwtSecret, nil
 	})
@@ -84,7 +81,7 @@ func ValidateJWT(tokenString string, jwtSecret []byte) (*Claims, error) {
 		return claims, nil
 	}
 
-	return nil, fmt.Errorf("invalid token")
+	return nil, jwt.ErrTokenInvalidClaims
 }
 
 // ExtractTokenFromHeader extracts JWT token from Authorization header
@@ -112,166 +109,121 @@ func GenerateRandomToken() (string, error) {
 }
 
 // AuthMiddleware is a middleware that validates JWT tokens
-func AuthMiddleware(next http.HandlerFunc, jwtSecret []byte) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tokenString := ExtractTokenFromHeader(r)
+func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenString := ExtractTokenFromHeader(c.Request)
 		if tokenString == "" {
-			http.Error(w, "Authorization token required", http.StatusUnauthorized)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization token required"})
+			c.Abort()
 			return
 		}
 
 		claims, err := ValidateJWT(tokenString, jwtSecret)
 		if err != nil {
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			c.Abort()
 			return
 		}
 
-		// Add user info to request context for use in handlers
-		r.Header.Set("X-User-ID", fmt.Sprintf("%d", claims.UserID))
-		r.Header.Set("X-Username", claims.Username)
+		c.Set("user_id", claims.UserID)
+		c.Set("username", claims.Username)
 
-		next.ServeHTTP(w, r)
+		c.Next()
 	}
 }
 
-// LoginHandler returns a login handler with the JWT secret
-func LoginHandler(jwtSecret []byte) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+// LoginHandler returns a login handler with the JWT secret and DB
+func LoginHandler(db *gorm.DB, jwtSecret []byte) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		var req AuthRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
 			return
 		}
-
-		// TODO: Get user from database
-		// For now, we'll use a mock user
-		mockUser := yapyapModels.User{
-			ID:         1,
-			Username:   req.Username,
-			CreatedAt:  time.Now(),
-			Status:     yapyapModels.StatusActive,
-			LastActive: time.Now(),
-			Bio:        "Test user",
-		}
-
-		// TODO: Validate password against database hash
-		// For now, we'll accept any password for demo purposes
 		if req.Username == "" || req.Password == "" {
-			http.Error(w, "Username and password required", http.StatusBadRequest)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password required"})
 			return
 		}
-
-		// Generate JWT token
-		token, err := GenerateJWT(mockUser.ID, mockUser.Username, jwtSecret)
+		var user yapyapModels.User
+		if err := db.Where("username = ?", req.Username).First(&user).Error; err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+			return
+		}
+		if !CheckPasswordHash(req.Password, user.PasswordHash) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+			return
+		}
+		token, err := GenerateJWT(user.ID, user.Username, jwtSecret)
 		if err != nil {
-			http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 			return
 		}
-
-		// TODO: Save login token to database
-		loginToken := yapyapModels.UserLoginToken{
-			UserID:    mockUser.ID,
-			Token:     token,
-			CreatedAt: time.Now(),
-			LastUsed:  time.Now(),
-		}
-		_ = loginToken // Use this when you have database
-
 		response := AuthResponse{
-			UserID: mockUser.ID,
+			UserID: user.ID,
 			Token:  token,
-			User:   mockUser,
+			User:   user,
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		c.JSON(http.StatusOK, response)
 	}
 }
 
-// RegisterHandler returns a register handler with the JWT secret
-func RegisterHandler(jwtSecret []byte) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+// RegisterHandler returns a register handler with the JWT secret and DB
+func RegisterHandler(db *gorm.DB, jwtSecret []byte) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		var req RegisterRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
 			return
 		}
-
 		if req.Username == "" || req.Password == "" {
-			http.Error(w, "Username and password required", http.StatusBadRequest)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password required"})
 			return
 		}
-
-		// Hash password
+		var existing yapyapModels.User
+		if err := db.Where("username = ?", req.Username).First(&existing).Error; err == nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Username already exists"})
+			return
+		}
 		hashedPassword, err := HashPassword(req.Password)
 		if err != nil {
-			http.Error(w, "Failed to hash password", http.StatusInternalServerError)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 			return
 		}
-
-		// TODO: Save user to database
-		// For now, we'll create a mock user
 		newUser := yapyapModels.User{
-			ID:         2, // TODO: Get from database auto-increment
-			Username:   req.Username,
-			CreatedAt:  time.Now(),
-			Status:     yapyapModels.StatusActive,
-			LastActive: time.Now(),
-			Bio:        req.Bio,
+			Username:     req.Username,
+			PasswordHash: hashedPassword,
+			Status:       yapyapModels.StatusActive,
+			LastActive:   time.Now(),
+			Bio:          req.Bio,
 		}
-
-		_ = hashedPassword // Use this when saving to database
-
-		// Generate JWT token
+		if err := db.Create(&newUser).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
+			return
+		}
 		token, err := GenerateJWT(newUser.ID, newUser.Username, jwtSecret)
 		if err != nil {
-			http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 			return
 		}
-
 		response := AuthResponse{
 			UserID: newUser.ID,
 			Token:  token,
 			User:   newUser,
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(response)
+		c.JSON(http.StatusCreated, response)
 	}
 }
 
-// Backward compatibility handlers (deprecated - use factory functions above)
-
-// HandleLogin - deprecated, use LoginHandler instead
-func HandleLogin(w http.ResponseWriter, r *http.Request) {
-	// This is kept for backward compatibility but should not be used
-	// Use LoginHandler(jwtSecret) instead
-	http.Error(w, "Internal configuration error: JWT secret not provided", http.StatusInternalServerError)
-}
-
-// HandleRegister - deprecated, use RegisterHandler instead
-func HandleRegister(w http.ResponseWriter, r *http.Request) {
-	// This is kept for backward compatibility but should not be used
-	// Use RegisterHandler(jwtSecret) instead
-	http.Error(w, "Internal configuration error: JWT secret not provided", http.StatusInternalServerError)
-}
-
 // HandleGetCurrentUser handler - protected endpoint
-func HandleGetCurrentUser(w http.ResponseWriter, r *http.Request) {
-	username := r.Header.Get("X-Username")
-
-	// TODO: Get user from database using userID from X-User-ID header
-	// For now, return a mock user
+func HandleGetCurrentUser(c *gin.Context) {
+	username, _ := c.Get("username")
+	userID, _ := c.Get("user_id")
 	user := yapyapModels.User{
-		ID:         1,
-		Username:   username,
-		CreatedAt:  time.Now().Add(-24 * time.Hour), // Created yesterday
+		Model:      gorm.Model{ID: userID.(uint)},
+		Username:   username.(string),
 		Status:     yapyapModels.StatusActive,
 		LastActive: time.Now(),
 		Bio:        "Current authenticated user",
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(user)
+	c.JSON(http.StatusOK, user)
 }

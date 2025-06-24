@@ -1,0 +1,30 @@
+services:
+  app:
+    image: golang:1.24-alpine
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      - YP_JWT_SECRET=devsecret
+      - YP_HOST=0.0.0.0
+      - YP_PORT=8080
+      - YP_POSTGRES_URL=postgres://postgres:postgres@db:5432/yapyap?sslmode=disable
+    depends_on:
+      - db
+    command: sh -c "go mod tidy && go run main.go"
+    ports:
+      - "8080:8080"
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: yapyap
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

@@ -1,5 +1,9 @@
 package yapyap
 
+import (
+	"time"
+)
+
 type ChannelType uint
 
 const (
@@ -10,10 +14,12 @@ const (
 )
 
 type Channel struct {
-	ID        uint64      `json:"id"`
+	ID        uint64      `json:"id" gorm:"primaryKey;autoIncrement"`
 	Name      string      `json:"name"`
 	Type      ChannelType `json:"type"`
-	CreatedAt string      `json:"created_at"`
+	CreatedAt time.Time   `json:"created_at"`
+
+	Messages []ChannelMessage `json:"messages" gorm:"foreignKey:ChannelID"`
 }
 
 type ChannelPermissions struct {
@@ -31,13 +37,13 @@ type ChannelPermissions struct {
 }
 
 type ChannelMessage struct {
-	ID          uint64   `json:"id"`
-	ChannelID   uint64   `json:"channel_id"`
-	UserID      uint64   `json:"user_id"`
-	Content     string   `json:"content"`
-	Attachments []string `json:"attachments"` // URLs to attachments, if any
-	CreatedAt   string   `json:"created_at"`
-	UpdatedAt   string   `json:"updated_at"` // Optional, for edited messages
+	ID          uint64    `json:"id" gorm:"primaryKey;autoIncrement"`
+	ChannelID   uint64    `json:"channel_id" gorm:"index;not null"`
+	UserID      uint64    `json:"user_id" gorm:"index;not null"`
+	Content     string    `json:"content"`
+	Attachments string    `json:"attachments"` // JSON string for URLs
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"` // Optional, for edited messages
 }
 
 type ChannelPinnedMessage struct {
