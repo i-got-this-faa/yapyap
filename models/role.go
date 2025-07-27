@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 type PermissionState string
@@ -34,6 +36,7 @@ func (rp *RolePermissions) Scan(value interface{}) error {
 }
 
 type Role struct {
+	gorm.Model
 	ID          uint64          `json:"id" gorm:"primaryKey;autoIncrement"`
 	Name        string          `json:"name" gorm:"uniqueIndex;not null"`
 	Permissions RolePermissions `json:"permissions" gorm:"type:jsonb"`
@@ -43,10 +46,12 @@ type Role struct {
 }
 
 type UserRole struct {
-	ID        uint64    `json:"id" gorm:"primaryKey;autoIncrement"`
-	UserID    uint64    `json:"user_id" gorm:"index;not null"`
-	RoleID    uint64    `json:"role_id" gorm:"index;not null"`
-	CreatedAt time.Time `json:"created_at"`
+	gorm.Model
+	UserID uint64 `json:"user_id" gorm:"index;not null"`
+	RoleID uint64 `json:"role_id" gorm:"index;not null"`
+
+	// Relationships
+	Role Role `json:"role" gorm:"foreignKey:RoleID"`
 }
 
 // Helper for permission resolution

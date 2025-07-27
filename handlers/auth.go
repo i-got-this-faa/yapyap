@@ -200,6 +200,28 @@ func RegisterHandler(db *gorm.DB, jwtSecret []byte) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
 			return
 		}
+
+		// Create basic user permissions (non-admin)
+		permissions := yapyapModels.UserPermissions{
+			UserID:            uint(newUser.ID),
+			ViewAnalytics:     false,
+			SendMessages:      true,
+			SendAttachments:   true,
+			JoinVoiceChannels: true,
+			ManageMessages:    false,
+			ManageUsers:       false,
+			ManageChannels:    false,
+			ManageInstance:    false,
+			Admin:             false, // Regular users are not admins
+		}
+
+		if err := db.Create(&permissions).Error; err != nil {
+			// If permissions creation fails, delete the user to maintain consistency
+			db.Delete(&newUser)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user permissions"})
+			return
+		}
+
 		token, err := GenerateJWT(newUser.ID, newUser.Username, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
@@ -226,4 +248,157 @@ func HandleGetCurrentUser(c *gin.Context) {
 		Bio:        "Current authenticated user",
 	}
 	c.JSON(http.StatusOK, user)
+}
+
+// AdminCreateRequest represents an admin user creation request
+type AdminCreateRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Email    string `json:"email"`
+}
+
+// RequireAdminMiddleware returns a middleware that checks if user has admin role
+func RequireAdminMiddleware(db *gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// First check if user is authenticated
+		userID, exists := c.Get("user_id")
+		if !exists {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+			c.Abort()
+			return
+		}
+
+		// Check if user has admin role
+		var adminRole yapyapModels.Role
+		if err := db.Where("name = ?", "admin").First(&adminRole).Error; err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+			c.Abort()
+			return
+		}
+
+		var userRole yapyapModels.UserRole
+		if err := db.Where("user_id = ? AND role_id = ?", userID, adminRole.ID).First(&userRole).Error; err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// CreateAdminHandler returns a handler for creating admin users - requires admin authentication
+func CreateAdminHandler(db *gorm.DB, jwtSecret []byte) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req AdminCreateRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
+			return
+		}
+
+		if req.Username == "" || req.Password == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password required"})
+			return
+		}
+
+		// Check if username already exists
+		var existing yapyapModels.User
+		if err := db.Where("username = ?", req.Username).First(&existing).Error; err == nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Username already exists"})
+			return
+		}
+
+		// Hash password
+		hashedPassword, err := HashPassword(req.Password)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+			return
+		}
+
+		// Create user
+		newUser := yapyapModels.User{
+			Username:     req.Username,
+			PasswordHash: hashedPassword,
+			Status:       yapyapModels.StatusActive,
+			LastActive:   time.Now(),
+		}
+
+		if err := db.Create(&newUser).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
+			return
+		}
+
+		// Create admin permissions
+		permissions := yapyapModels.UserPermissions{
+			UserID:            uint(newUser.ID),
+			ViewAnalytics:     true,
+			SendMessages:      true,
+			SendAttachments:   true,
+			JoinVoiceChannels: true,
+			ManageMessages:    true,
+			ManageUsers:       true,
+			ManageChannels:    true,
+			ManageInstance:    true,
+			Admin:             true,
+		}
+
+		if err := db.Create(&permissions).Error; err != nil {
+			// If permissions creation fails, delete the user to maintain consistency
+			db.Delete(&newUser)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create admin permissions"})
+			return
+		}
+
+		// Assign admin role
+		var adminRole yapyapModels.Role
+		if err := db.Where("name = ?", "admin").First(&adminRole).Error; err != nil {
+			// If admin role doesn't exist, create it
+			adminPermissions := yapyapModels.RolePermissions{
+				"ViewAnalytics":     yapyapModels.PermissionAllow,
+				"SendMessages":      yapyapModels.PermissionAllow,
+				"SendAttachments":   yapyapModels.PermissionAllow,
+				"JoinVoiceChannels": yapyapModels.PermissionAllow,
+				"ManageMessages":    yapyapModels.PermissionAllow,
+				"ManageUsers":       yapyapModels.PermissionAllow,
+				"ManageChannels":    yapyapModels.PermissionAllow,
+				"ManageInstance":    yapyapModels.PermissionAllow,
+				"Admin":             yapyapModels.PermissionAllow,
+			}
+
+			adminRole = yapyapModels.Role{
+				Name:        "admin",
+				Permissions: adminPermissions,
+			}
+
+			if err := db.Create(&adminRole).Error; err != nil {
+				db.Delete(&newUser)
+				db.Delete(&permissions)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create admin role"})
+				return
+			}
+		}
+
+		// Assign admin role to user
+		userRole := yapyapModels.UserRole{
+			UserID: uint64(newUser.ID),
+			RoleID: uint64(adminRole.ID),
+		}
+
+		if err := db.Create(&userRole).Error; err != nil {
+			// If role assignment fails, delete the user and permissions to maintain consistency
+			db.Delete(&newUser)
+			db.Delete(&permissions)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to assign admin role"})
+			return
+		}
+
+		// Don't return a token - admin creation is for other admins, not auto-login
+		response := gin.H{
+			"message":  "Admin user created successfully",
+			"user_id":  newUser.ID,
+			"username": newUser.Username,
+		}
+
+		c.JSON(http.StatusCreated, response)
+	}
 }

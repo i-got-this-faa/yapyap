@@ -4,5 +4,7 @@
   "port": 8080,
   "jwt_secret": "Use-Your-Own-Secret-FCS",
   "postgres_url": "postgres://postgres:postgres@db:5432/yapyap?sslmode=disable",
-  "permission_cache_sync_seconds": 300
+  "permission_cache_sync_seconds": 300,
+  "_comment": "admin_user_ids: Array of user IDs to assign admin role on startup. Users must already exist.",
+  "admin_user_ids": [1, 2, 3]
 }
