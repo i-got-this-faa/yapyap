@@ -185,7 +185,7 @@ func NewYapYap(cfg *YapYapConfig) *YapYap {
 	if err != nil {
 		log.Fatalf("Failed to connect to Postgres: %v", err)
 	}
-	db.AutoMigrate(&models.User{}, &models.UserPermissions{}, &models.UserLoginToken{}, &models.Channel{}, &models.ChannelMessage{}, &models.Role{}, &models.UserRole{}, &models.Log{})
+	db.AutoMigrate(&models.User{}, &models.UserPermissions{}, &models.UserLoginToken{}, &models.Channel{}, &models.ChannelMessage{}, &models.Role{}, &models.UserRole{}, &models.Log{}, &models.ChannelOverwrite{})
 
 	// Create logger
 	logger := utils.NewLogger(db)
@@ -390,10 +390,8 @@ func (s *YapYap) HandleCreateMessage(c *gin.Context) {
 		return
 	}
 
-	// Check permissions
-	var perm models.ChannelPermissions
-	err := s.DB.Where("user_id = ? AND channel_id = ?", userID, msgData.ChannelID).First(&perm).Error
-	if err != nil || !perm.SendMessage {
+	// Check permissions (channel-aware)
+	if !s.HasChannelFlag(userID.(uint64), msgData.ChannelID, models.PERM_SEND_MESSAGES) && !s.HasGlobalFlag(userID.(uint64), models.PERM_ADMINISTRATOR) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -439,14 +437,8 @@ func (s *YapYap) HandleCreateChannel(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin or manage channels permission
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdminOrManageChannels(&user) {
+	// Check if user has admin or manage channels permission (unified)
+	if !(s.HasPermission(userID.(uint64), "Admin") || s.HasPermission(userID.(uint64), "ManageChannels")) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -505,14 +497,8 @@ func (s *YapYap) HandleUpdateChannel(c *gin.Context) {
 		return
 	}
 
-	// Check permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdminOrManageChannels(&user) {
+	// Check permissions (unified)
+	if !(s.HasPermission(userID.(uint64), "Admin") || s.HasPermission(userID.(uint64), "ManageChannels")) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -569,14 +555,8 @@ func (s *YapYap) HandleDeleteChannel(c *gin.Context) {
 		return
 	}
 
-	// Check permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdminOrManageChannels(&user) {
+	// Check permissions (unified)
+	if !(s.HasPermission(userID.(uint64), "Admin") || s.HasPermission(userID.(uint64), "ManageChannels")) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -619,10 +599,9 @@ func (s *YapYap) HandleGetChannelMessages(c *gin.Context) {
 		return
 	}
 
-	// Check view permissions
-	var perm models.ChannelPermissions
-	err := s.DB.Where("user_id = ? AND channel_id = ?", userID, channelID).First(&perm).Error
-	if err != nil || !perm.ViewChannel {
+	// Check view permissions via flags
+	chID := parseUint64(channelID)
+	if !s.HasChannelFlag(userID.(uint64), chID, models.PERM_VIEW_CHANNEL) && !s.HasGlobalFlag(userID.(uint64), models.PERM_ADMINISTRATOR) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -634,14 +613,115 @@ func (s *YapYap) HandleGetChannelMessages(c *gin.Context) {
 		}
 	}
 
-	var messages []models.ChannelMessage
-	err = s.DB.Where("channel_id = ?", channelID).Order("created_at desc").Limit(limit).Find(&messages).Error
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch messages"})
+	before := c.Query("before")
+	after := c.Query("after")
+	around := c.Query("around")
+
+	// Ensure only one of before/after/around is used
+	used := 0
+	if before != "" {
+		used++
+	}
+	if after != "" {
+		used++
+	}
+	if around != "" {
+		used++
+	}
+	if used > 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Use only one of before, after, or around"})
 		return
 	}
 
-	c.JSON(http.StatusOK, messages)
+	// No cursor params: latest messages, DESC
+	if used == 0 {
+		var messages []models.ChannelMessage
+		if err := s.DB.Where("channel_id = ?", chID).Order("created_at desc").Limit(limit).Find(&messages).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch messages"})
+			return
+		}
+		c.JSON(http.StatusOK, messages)
+		return
+	}
+
+	// Helper to fetch pivot message
+	getPivot := func(idStr string) (*models.ChannelMessage, bool) {
+		mid := parseUint64(idStr)
+		if mid == 0 {
+			return nil, false
+		}
+		var pivot models.ChannelMessage
+		if err := s.DB.Where("id = ? AND channel_id = ?", mid, chID).First(&pivot).Error; err != nil {
+			return nil, false
+		}
+		return &pivot, true
+	}
+
+	if around != "" {
+		pivot, ok := getPivot(around)
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Pivot message not found"})
+			return
+		}
+		half := limit / 2
+
+		// Newer than pivot (more recent), order DESC, limit half
+		var newer []models.ChannelMessage
+		if half > 0 {
+			_ = s.DB.Where("channel_id = ? AND created_at > ?", chID, pivot.CreatedAt).
+				Order("created_at desc").Limit(half).Find(&newer).Error
+		}
+
+		// Older than pivot, order DESC, limit remaining
+		var older []models.ChannelMessage
+		rem := limit - len(newer)
+		if rem > 0 {
+			_ = s.DB.Where("channel_id = ? AND created_at < ?", chID, pivot.CreatedAt).
+				Order("created_at desc").Limit(rem).Find(&older).Error
+		}
+
+		// Combine: newer (DESC), pivot, older (DESC)
+		out := make([]models.ChannelMessage, 0, len(newer)+1+len(older))
+		out = append(out, newer...)
+		out = append(out, *pivot)
+		out = append(out, older...)
+		c.JSON(http.StatusOK, out)
+		return
+	}
+
+	if before != "" {
+		pivot, ok := getPivot(before)
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Pivot message not found"})
+			return
+		}
+		var messages []models.ChannelMessage
+		if err := s.DB.Where("channel_id = ? AND created_at < ?", chID, pivot.CreatedAt).
+			Order("created_at desc").Limit(limit).Find(&messages).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch messages"})
+			return
+		}
+		c.JSON(http.StatusOK, messages)
+		return
+	}
+
+	// after
+	pivot, ok := getPivot(after)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Pivot message not found"})
+		return
+	}
+	var asc []models.ChannelMessage
+	if err := s.DB.Where("channel_id = ? AND created_at > ?", chID, pivot.CreatedAt).
+		Order("created_at asc").Limit(limit).Find(&asc).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch messages"})
+		return
+	}
+	// Reverse to return DESC to keep consistency
+	for i, j := 0, len(asc)-1; i < j; i, j = i+1, j-1 {
+		asc[i], asc[j] = asc[j], asc[i]
+	}
+	c.JSON(http.StatusOK, asc)
 }
 
 // HandleListChannels lists all channels the user can view
@@ -652,34 +732,21 @@ func (s *YapYap) HandleListChannels(c *gin.Context) {
 		return
 	}
 
-	// Get channels the user has permissions for
-	var permissions []models.ChannelPermissions
-	err := s.DB.Where("user_id = ? AND view_channel = ?", userID, true).Find(&permissions).Error
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch permissions"})
-		return
-	}
-
-	if len(permissions) == 0 {
-		c.JSON(http.StatusOK, []models.Channel{})
-		return
-	}
-
-	// Extract channel IDs
-	channelIDs := make([]uint64, len(permissions))
-	for i, perm := range permissions {
-		channelIDs[i] = perm.ChannelID
-	}
-
-	// Get channels
+	// List channels the user can view by filtering
 	var channels []models.Channel
-	err = s.DB.Where("id IN ?", channelIDs).Find(&channels).Error
-	if err != nil {
+	if err := s.DB.Find(&channels).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch channels"})
 		return
 	}
 
-	c.JSON(http.StatusOK, channels)
+	visible := make([]models.Channel, 0, len(channels))
+	for _, ch := range channels {
+		if s.HasChannelFlag(userID.(uint64), ch.ID, models.PERM_VIEW_CHANNEL) || s.HasGlobalFlag(userID.(uint64), models.PERM_ADMINISTRATOR) {
+			visible = append(visible, ch)
+		}
+	}
+
+	c.JSON(http.StatusOK, visible)
 }
 
 // HandleGetChannel gets a single channel by ID
@@ -697,9 +764,7 @@ func (s *YapYap) HandleGetChannel(c *gin.Context) {
 	}
 
 	// Check view permissions
-	var perm models.ChannelPermissions
-	err := s.DB.Where("user_id = ? AND channel_id = ?", userID, channelID).First(&perm).Error
-	if err != nil || !perm.ViewChannel {
+	if !s.HasChannelFlag(userID.(uint64), parseUint64(channelID), models.PERM_VIEW_CHANNEL) && !s.HasGlobalFlag(userID.(uint64), models.PERM_ADMINISTRATOR) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -743,11 +808,9 @@ func (s *YapYap) HandleUpdateMessage(c *gin.Context) {
 		return
 	}
 
-	// Check if user owns the message or has manage permissions
+	// Check if user owns the message or has manage permissions (unified)
 	if message.UserID != userID.(uint64) {
-		var perm models.ChannelPermissions
-		err := s.DB.Where("user_id = ? AND channel_id = ?", userID, message.ChannelID).First(&perm).Error
-		if err != nil || !perm.ManageMessages {
+		if !s.HasPermission(userID.(uint64), "ManageMessages") && !s.HasPermission(userID.(uint64), "Admin") {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 			return
 		}
@@ -796,11 +859,9 @@ func (s *YapYap) HandleDeleteMessage(c *gin.Context) {
 		return
 	}
 
-	// Check if user owns the message or has manage permissions
+	// Check if user owns the message or has manage permissions (unified)
 	if message.UserID != userID.(uint64) {
-		var perm models.ChannelPermissions
-		err := s.DB.Where("user_id = ? AND channel_id = ?", userID, message.ChannelID).First(&perm).Error
-		if err != nil || !perm.ManageMessages {
+		if !s.HasPermission(userID.(uint64), "ManageMessages") && !s.HasPermission(userID.(uint64), "Admin") {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 			return
 		}
@@ -832,14 +893,8 @@ func (s *YapYap) HandleListUsers(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdminOrManageUsers(&user) {
+	// Check if user has admin or manage users permissions (unified)
+	if !(s.HasPermission(userID.(uint64), "Admin") || s.HasPermission(userID.(uint64), "ManageUsers")) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -893,14 +948,8 @@ func (s *YapYap) HandleUpdateChannelPermissions(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin or manage channels permission
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdminOrManageChannels(&user) {
+	// Check if user has admin or manage channels permission (unified)
+	if !(s.HasPermission(userID.(uint64), "Admin") || s.HasPermission(userID.(uint64), "ManageChannels")) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -973,14 +1022,8 @@ func (s *YapYap) HandleListRoles(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdmin(&user) {
+	// Check if user has admin permissions (unified)
+	if !s.HasPermission(userID.(uint64), "Admin") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -1003,14 +1046,8 @@ func (s *YapYap) HandleCreateRole(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdmin(&user) {
+	// Check if user has admin permissions (unified)
+	if !s.HasPermission(userID.(uint64), "Admin") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -1054,14 +1091,8 @@ func (s *YapYap) HandleUpdateRole(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdmin(&user) {
+	// Check if user has admin permissions (unified)
+	if !s.HasPermission(userID.(uint64), "Admin") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -1112,14 +1143,8 @@ func (s *YapYap) HandleDeleteRole(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdmin(&user) {
+	// Check if user has admin permissions (unified)
+	if !s.HasPermission(userID.(uint64), "Admin") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -1152,14 +1177,8 @@ func (s *YapYap) HandleAssignRole(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdmin(&user) {
+	// Check if user has admin permissions (unified)
+	if !s.HasPermission(userID.(uint64), "Admin") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -1203,14 +1222,8 @@ func (s *YapYap) HandleRemoveRole(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdmin(&user) {
+	// Check if user has admin permissions (unified)
+	if !s.HasPermission(userID.(uint64), "Admin") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -1294,14 +1307,8 @@ func (s *YapYap) HandleGetRoleUsers(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.Preload("Permissions").First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	if !userHasAdmin(&user) {
+	// Check if user has admin permissions (unified)
+	if !s.HasPermission(userID.(uint64), "Admin") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -1339,11 +1346,8 @@ func (s *YapYap) HandleGetLogs(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
-
-	// Check if user has admin permissions (you may want to implement this check)
-	var user models.User
-	if err := s.DB.First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+	if !s.HasPermission(userID.(uint64), "Admin") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
 
@@ -1417,7 +1421,7 @@ func (s *YapYap) HandleGetLogs(c *gin.Context) {
 	}
 
 	// Log the access
-	s.Logger.LogWithUser(models.LogLevelInfo, models.LogAction("admin.logs.view"), "Admin viewed logs", uint64(user.ID), c)
+	s.Logger.LogWithUser(models.LogLevelInfo, models.LogAction("admin.logs.view"), "Admin viewed logs", userID.(uint64), c)
 
 	c.JSON(http.StatusOK, gin.H{
 		"logs":        logs,
@@ -1435,11 +1439,8 @@ func (s *YapYap) HandleGetLogStats(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
-
-	// Check if user has admin permissions
-	var user models.User
-	if err := s.DB.First(&user, userID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+	if !s.HasPermission(userID.(uint64), "Admin") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
 
@@ -1452,7 +1453,7 @@ func (s *YapYap) HandleGetLogStats(c *gin.Context) {
 	}
 
 	// Log the access
-	s.Logger.LogWithUser(models.LogLevelInfo, models.LogAction("admin.logs.stats"), "Admin viewed log statistics", uint64(user.ID), c)
+	s.Logger.LogWithUser(models.LogLevelInfo, models.LogAction("admin.logs.stats"), "Admin viewed log statistics", userID.(uint64), c)
 
 	c.JSON(http.StatusOK, stats)
 }
@@ -1569,6 +1570,10 @@ func (s *YapYap) SetupRoutes() {
 			channels.DELETE("/:id", s.HandleDeleteChannel)                     // Delete channel
 			channels.GET("/:id/messages", s.HandleGetChannelMessages)          // Get channel messages
 			channels.PUT("/:id/permissions", s.HandleUpdateChannelPermissions) // Update channel permissions
+			// Channel overwrites management (Admin or ManageChannels)
+			channels.GET("/:id/overwrites", s.HandleListChannelOverwrites)
+			channels.PUT("/:id/overwrites", s.HandleUpsertChannelOverwrite)
+			channels.DELETE("/:id/overwrites", s.HandleDeleteChannelOverwrite)
 		}
 
 		// Message management (protected routes)
@@ -1749,6 +1754,147 @@ func (s *YapYap) StartPermissionSyncer(intervalSec int) {
 	}()
 }
 
+// HandleListChannelOverwrites lists all overwrites for a channel (Admin or ManageChannels required)
+func (s *YapYap) HandleListChannelOverwrites(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	channelID := c.Param("id")
+	if channelID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Channel ID required"})
+		return
+	}
+	uid := userID.(uint64)
+	if !(s.HasGlobalFlag(uid, models.PERM_ADMINISTRATOR) || s.HasGlobalFlag(uid, models.PERM_MANAGE_CHANNELS)) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
+		return
+	}
+
+	var overwrites []models.ChannelOverwrite
+	if err := s.DB.Where("channel_id = ?", channelID).Find(&overwrites).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch overwrites"})
+		return
+	}
+	c.JSON(http.StatusOK, overwrites)
+}
+
+type overwritePayload struct {
+	TargetType models.ChannelOverwriteTarget `json:"target_type" binding:"required"`
+	TargetID   uint64                        `json:"target_id" binding:"required"`
+	Allow      uint64                        `json:"allow"`
+	Deny       uint64                        `json:"deny"`
+}
+
+// HandleUpsertChannelOverwrite creates or updates a channel overwrite (Admin or ManageChannels required)
+func (s *YapYap) HandleUpsertChannelOverwrite(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	channelID := c.Param("id")
+	if channelID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Channel ID required"})
+		return
+	}
+	uid := userID.(uint64)
+	if !(s.HasGlobalFlag(uid, models.PERM_ADMINISTRATOR) || s.HasGlobalFlag(uid, models.PERM_MANAGE_CHANNELS)) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
+		return
+	}
+
+	var payload overwritePayload
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validate target exists (role or user)
+	switch payload.TargetType {
+	case models.OverwriteTargetRole:
+		var role models.Role
+		if err := s.DB.First(&role, payload.TargetID).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Role not found"})
+			return
+		}
+	case models.OverwriteTargetMember:
+		var user models.User
+		if err := s.DB.First(&user, payload.TargetID).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "User not found"})
+			return
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid target_type"})
+		return
+	}
+
+	var ow models.ChannelOverwrite
+	q := s.DB.Where("channel_id = ? AND target_type = ? AND target_id = ?", channelID, payload.TargetType, payload.TargetID)
+	if err := q.First(&ow).Error; err != nil {
+		// create
+		ow = models.ChannelOverwrite{
+			ChannelID:  parseUint64(channelID),
+			TargetType: payload.TargetType,
+			TargetID:   payload.TargetID,
+			Allow:      payload.Allow,
+			Deny:       payload.Deny,
+		}
+		if err := s.DB.Create(&ow).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create overwrite"})
+			return
+		}
+		c.JSON(http.StatusCreated, ow)
+		return
+	}
+
+	// update
+	ow.Allow = payload.Allow
+	ow.Deny = payload.Deny
+	if err := s.DB.Save(&ow).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update overwrite"})
+		return
+	}
+	c.JSON(http.StatusOK, ow)
+}
+
+// HandleDeleteChannelOverwrite deletes a specific overwrite (Admin or ManageChannels required)
+func (s *YapYap) HandleDeleteChannelOverwrite(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	channelID := c.Param("id")
+	if channelID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Channel ID required"})
+		return
+	}
+	uid := userID.(uint64)
+	if !(s.HasGlobalFlag(uid, models.PERM_ADMINISTRATOR) || s.HasGlobalFlag(uid, models.PERM_MANAGE_CHANNELS)) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
+		return
+	}
+
+	var payload overwritePayload
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result := s.DB.Where("channel_id = ? AND target_type = ? AND target_id = ?", channelID, payload.TargetType, payload.TargetID).Delete(&models.ChannelOverwrite{})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete overwrite"})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Overwrite not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Overwrite deleted"})
+}
+
 type PermissionState string
 
 const (
@@ -1765,17 +1911,42 @@ func (s *YapYap) GetUserPermission(userID uint64, permKey PermissionCheckType) P
 	var up models.UserPermissions
 	if err := s.DB.Where("user_id = ?", userID).First(&up).Error; err == nil {
 		switch permKey {
-		case "ViewChannel":
+		case "ViewAnalytics":
 			if up.ViewAnalytics {
 				return PermissionAllow
-			} // Example mapping
-			return PermissionUnset
-		case "SendMessage":
+			}
+		case "SendMessages":
 			if up.SendMessages {
 				return PermissionAllow
 			}
-			return PermissionUnset
-			// ...add other permission mappings as needed...
+		case "SendAttachments":
+			if up.SendAttachments {
+				return PermissionAllow
+			}
+		case "JoinVoiceChannels":
+			if up.JoinVoiceChannels {
+				return PermissionAllow
+			}
+		case "ManageMessages":
+			if up.ManageMessages {
+				return PermissionAllow
+			}
+		case "ManageUsers":
+			if up.ManageUsers {
+				return PermissionAllow
+			}
+		case "ManageChannels":
+			if up.ManageChannels {
+				return PermissionAllow
+			}
+		case "ManageInstance":
+			if up.ManageInstance {
+				return PermissionAllow
+			}
+		case "Admin":
+			if up.Admin {
+				return PermissionAllow
+			}
 		}
 	}
 	return PermissionUnset
@@ -1822,34 +1993,7 @@ func (s *YapYap) HasPermission(userID uint64, permKey PermissionCheckType) bool 
 	return rolePerm == PermissionAllow
 }
 
-func userHasAdminOrManageChannels(user *models.User) bool {
-	for _, perm := range user.Permissions {
-		if perm.Admin || perm.ManageChannels {
-			return true
-		}
-	}
-	return false
-}
-
-// Helper function to check if user has admin permission
-func userHasAdmin(user *models.User) bool {
-	for _, perm := range user.Permissions {
-		if perm.Admin {
-			return true
-		}
-	}
-	return false
-}
-
-// Helper function to check if user has admin or manage users permission
-func userHasAdminOrManageUsers(user *models.User) bool {
-	for _, perm := range user.Permissions {
-		if perm.Admin || perm.ManageUsers {
-			return true
-		}
-	}
-	return false
-}
+// Note: Permission checks should use HasPermission(userID, key) to avoid drift
 
 // Helper function to parse uint64 from string
 func parseUint64(s string) uint64 {

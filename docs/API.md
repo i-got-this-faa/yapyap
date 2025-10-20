@@ -259,10 +259,15 @@ Delete a channel (requires admin or manage channels permission).
 ```
 
 #### GET /channels/:id/messages
-Get messages from a channel.
+Get messages from a channel. Results are ordered newest-first.
 
 **Query Parameters:**
 - `limit` (optional) - Number of messages to retrieve (default: 50, max: 100)
+- `before` (optional) - Return messages older than the message with this ID
+- `after` (optional) - Return messages newer than the message with this ID (returned newest-first)
+- `around` (optional) - Return a window around the message with this ID (half newer + half older + pivot)
+
+Use only one of `before`, `after`, or `around`.
 
 **Response (200 OK):**
 ```json
@@ -306,6 +311,66 @@ Update channel permissions for a user (requires admin or manage channels permiss
   "manage_messages": false,
   "manage_channel": false
 }
+```
+
+#### Overwrites: Channel permission overwrites (Admin or Manage Channels)
+
+These endpoints manage Discord-like per-channel allow/deny overwrites for roles or members.
+
+Targets:
+- `target_type`: `0` for role, `1` for member
+- `target_id`: the role ID or user ID
+
+##### GET /channels/:id/overwrites
+List all overwrites for a channel.
+
+**Response (200 OK):**
+```json
+[
+  {
+    "id": 10,
+    "channel_id": 1,
+    "target_type": 0,
+    "target_id": 3,
+    "allow": 3,
+    "deny": 0,
+    "created_at": "2025-06-30T12:00:00Z"
+  }
+]
+```
+
+##### PUT /channels/:id/overwrites
+Create or update a channel overwrite.
+
+**Request Body:**
+```json
+{
+  "target_type": 0,
+  "target_id": 3,
+  "allow": 3,
+  "deny": 0
+}
+```
+
+`allow` and `deny` are bitmasks composed of permission flags (see Standards). For example, `3` is VIEW_CHANNEL | SEND_MESSAGES.
+
+**Response (201 Created | 200 OK):**
+Returns the created/updated overwrite.
+
+##### DELETE /channels/:id/overwrites
+Delete a channel overwrite.
+
+**Request Body:**
+```json
+{
+  "target_type": 0,
+  "target_id": 3
+}
+```
+
+**Response (200 OK):**
+```json
+{ "message": "Overwrite deleted" }
 ```
 
 ### Messages
