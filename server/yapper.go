@@ -25,13 +25,17 @@ import (
 
 // YapYapConfig holds server config loaded from config.json
 type YapYapConfig struct {
-	InstanceName               string   `json:"instance_name"`
-	Host                       string   `json:"host"`
-	Port                       int      `json:"port"`
-	JWTSecret                  string   `json:"jwt_secret"`
-	PostgresURL                string   `json:"postgres_url"`
-	PermissionCacheSyncSeconds int      `json:"permission_cache_sync_seconds"`
-	AdminUserIDs               []uint64 `json:"admin_user_ids"`
+	InstanceName                string                 `json:"instance_name"`
+	Host                        string                 `json:"host"`
+	Port                        int                    `json:"port"`
+	JWTSecret                   string                 `json:"jwt_secret"`
+	PostgresURL                 string                 `json:"postgres_url"`
+	PermissionCacheSyncSeconds  int                    `json:"permission_cache_sync_seconds"`
+	AdminUserIDs                []uint64               `json:"admin_user_ids"`
+	VoiceEnabled                bool                   `json:"voice_enabled"`
+	VoiceSignalVersion          string                 `json:"voice_signal_version"`
+	VoiceMaxParticipantsPerRoom int                    `json:"voice_max_participants_per_room"`
+	VoiceICEServers             []VoiceICEServerConfig `json:"voice_ice_servers"`
 }
 
 // initializeAdminRoles assigns admin roles to specified user IDs
@@ -165,6 +169,7 @@ type YapYap struct {
 	mu       sync.RWMutex
 	DB       *gorm.DB
 	Logger   *utils.Logger // Database logger
+	Voice    *VoiceRuntime
 }
 
 type Client struct {
@@ -210,6 +215,7 @@ func NewYapYap(cfg *YapYapConfig) *YapYap {
 			},
 		},
 		clients: make(map[*websocket.Conn]*Client),
+		Voice:   NewVoiceRuntime(cfg),
 	}
 }
 
@@ -1546,6 +1552,7 @@ func (s *YapYap) SetupRoutes() {
 
 	// WebSocket endpoint
 	s.Engine.GET("/ws", s.HandleWebSocket)
+	s.Engine.GET("/ws/rtc", s.HandleRTCWebSocket)
 
 	// API routes
 	api := s.Engine.Group("/api/v1")
@@ -1553,6 +1560,7 @@ func (s *YapYap) SetupRoutes() {
 		api.POST("/auth/login", authHandlers.LoginHandler(s.DB, s.JWTSecret))
 		api.POST("/auth/register", authHandlers.RegisterHandler(s.DB, s.JWTSecret))
 		api.GET("/users/me", authHandlers.AuthMiddleware(s.JWTSecret), authHandlers.HandleGetCurrentUser)
+		api.GET("/voice/config", authHandlers.AuthMiddleware(s.JWTSecret), s.HandleVoiceConfig)
 
 		// Admin-only routes
 		admin := api.Group("/admin", authHandlers.AuthMiddleware(s.JWTSecret), authHandlers.RequireAdminMiddleware(s.DB))
@@ -1667,6 +1675,10 @@ func (s *YapYap) GracefullExit() {
 		delete(s.clients, conn)
 	}
 	log.Println("WebSocket connections closed")
+
+	if s.Voice != nil {
+		s.Voice.closeAllClients()
+	}
 
 	// TODO: Save Server state to Database
 

@@ -871,6 +871,69 @@ ws://localhost:8080/ws?token=your_jwt_token
 
 The WebSocket connection is **server-to-client only** for real-time notifications. All client actions must use the REST API endpoints documented above.
 
+### Voice Signaling WebSocket (WebRTC)
+
+For low-latency group voice chat, use the dedicated signaling socket.
+
+**WebSocket Endpoint:** `/ws/rtc`
+
+**Authentication:** Include JWT token as query parameter:
+```
+ws://localhost:8080/ws/rtc?token=your_jwt_token
+```
+
+**Protocol Version:** `v1`
+
+Signaling messages use this envelope:
+```json
+{
+  "version": "v1",
+  "type": "voice.join",
+  "request_id": "optional-client-id",
+  "channel_id": 42,
+  "payload": {}
+}
+```
+
+Client -> Server event types:
+- `voice.join`
+- `voice.leave`
+- `webrtc.offer`
+- `webrtc.answer`
+- `webrtc.ice_candidate`
+- `voice.mute`
+
+Server -> Client event types:
+- `voice.joined`
+- `voice.left`
+- `voice.room_state`
+- `voice.participant_joined`
+- `voice.participant_left`
+- `voice.participant_updated`
+- `webrtc.offer` (renegotiation)
+- `webrtc.answer`
+- `webrtc.ice_candidate`
+- `voice.error`
+
+### GET /voice/config
+
+Get voice runtime config for bootstrapping external clients (requires authentication).
+
+**Response (200 OK):**
+```json
+{
+  "voice_enabled": true,
+  "protocol_version": "v1",
+  "ws_endpoint": "/ws/rtc",
+  "room_max_participants": 8,
+  "ice_servers": [
+    {"urls": ["stun:coturn:3478"]},
+    {"urls": ["turn:coturn:3478?transport=udp"], "username": "yapyap", "credential": "yapyap-secret"}
+  ],
+  "plain_ws_only": true
+}
+```
+
 ## Error Codes
 
 - `400 Bad Request` - Invalid request format or missing required fields

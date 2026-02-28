@@ -5,6 +5,24 @@
   "jwt_secret": "Use-Your-Own-Secret-FCS",
   "postgres_url": "postgres://postgres:postgres@db:5432/yapyap?sslmode=disable",
   "permission_cache_sync_seconds": 300,
+  "voice_enabled": true,
+  "voice_signal_version": "v1",
+  "voice_max_participants_per_room": 8,
+  "voice_ice_servers": [
+    {
+      "urls": [
+        "stun:coturn:3478"
+      ]
+    },
+    {
+      "urls": [
+        "turn:coturn:3478?transport=udp",
+        "turn:coturn:3478?transport=tcp"
+      ],
+      "username": "yapyap",
+      "credential": "yapyap-secret"
+    }
+  ],
   "_comment": "admin_user_ids: Array of user IDs to assign admin role on startup. Users must already exist.",
   "admin_user_ids": [1, 2, 3]
 }

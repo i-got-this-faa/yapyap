@@ -11,6 +11,7 @@ services:
       - YP_POSTGRES_URL=postgres://postgres:postgres@db:5432/yapyap?sslmode=disable
     depends_on:
       - db
+      - coturn
     command: sh -c "go mod tidy && go run main.go"
     ports:
       - "8080:8080"
@@ -25,6 +26,22 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+
+  coturn:
+    image: instrumentisto/coturn:latest
+    command:
+      - -n
+      - --log-file=stdout
+      - --lt-cred-mech
+      - --realm=yapyap.local
+      - --user=yapyap:yapyap-secret
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49160-49200:49160-49200/udp"
 
 volumes:
   pgdata:
