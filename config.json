@@ -24,5 +24,5 @@
     }
   ],
   "_comment": "admin_user_ids: Array of user IDs to assign admin role on startup. Users must already exist.",
-  "admin_user_ids": [1, 2, 3]
+  "admin_user_ids": [1, 2]
 }

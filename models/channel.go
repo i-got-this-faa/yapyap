@@ -27,10 +27,12 @@ type Channel struct {
 }
 
 type ChannelPermissions struct {
-	gorm.Model
-	ID        uint64 `json:"id" gorm:"primaryKey;autoIncrement"`
-	ChannelID uint64 `json:"channel_id" gorm:"index;not null"`
-	UserID    uint64 `json:"user_id" gorm:"index;not null"`
+	ID        uint64         `json:"id" gorm:"primaryKey;autoIncrement"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+	ChannelID uint64         `json:"channel_id" gorm:"index;not null"`
+	UserID    uint64         `json:"user_id" gorm:"index;not null"`
 
 	ViewChannel bool `json:"view_channel"`
 

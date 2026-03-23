@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -156,8 +157,9 @@ type YapYap struct {
 	Port int    `json:"port"` // The port of the YapYap instance
 
 	// Database settings
-	PostgresURL string `json:"postgres_url"` // The URL to connect to the Postgres database
-	RedisURL    string `json:"redis_url"`    // The URL to connect to the Redis
+	PostgresURL                string `json:"postgres_url"`                  // The URL to connect to the Postgres database
+	RedisURL                   string `json:"redis_url"`                     // The URL to connect to the Redis
+	PermissionCacheSyncSeconds int    `json:"permission_cache_sync_seconds"` // Background permission cache refresh interval
 
 	// JWT settings
 	JWTSecret []byte `json:"-"` // JWT secret for authentication (excluded from JSON)
@@ -179,6 +181,83 @@ type Client struct {
 	Channels    map[uint64]bool                      // Channel IDs this client is a member of
 	PermCache   map[uint64]models.ChannelPermissions // channelID -> permissions
 	permCacheMu sync.RWMutex
+	closeOnce   sync.Once
+}
+
+func (s *YapYap) snapshotClients() []*Client {
+	s.mu.RLock()
+	clients := make([]*Client, 0, len(s.clients))
+	for _, client := range s.clients {
+		clients = append(clients, client)
+	}
+	s.mu.RUnlock()
+	return clients
+}
+
+func (s *YapYap) syncConnectedClientPermissions(userID uint64) {
+	for _, client := range s.snapshotClients() {
+		if client.UserID == userID {
+			s.SyncPermissions(client)
+		}
+	}
+}
+
+func (s *YapYap) syncUsersWithRolePermissions(roleID uint64) {
+	var userRoles []models.UserRole
+	if err := s.DB.Where("role_id = ?", roleID).Find(&userRoles).Error; err != nil {
+		log.Printf("Failed to load user roles for role %d: %v", roleID, err)
+		return
+	}
+	seen := make(map[uint64]struct{}, len(userRoles))
+	for _, userRole := range userRoles {
+		if _, ok := seen[userRole.UserID]; ok {
+			continue
+		}
+		seen[userRole.UserID] = struct{}{}
+		s.syncConnectedClientPermissions(userRole.UserID)
+	}
+}
+
+func channelPermissionsFromFlags(userID, channelID, flags uint64) models.ChannelPermissions {
+	return models.ChannelPermissions{
+		UserID:         userID,
+		ChannelID:      channelID,
+		ViewChannel:    flags&models.PERM_VIEW_CHANNEL != 0,
+		SendMessage:    flags&models.PERM_SEND_MESSAGES != 0,
+		SendAttachment: flags&models.PERM_SEND_ATTACHMENTS != 0,
+		ManageMessages: flags&models.PERM_MANAGE_MESSAGES != 0,
+		ManageChannel:  flags&models.PERM_MANAGE_CHANNELS != 0,
+	}
+}
+
+func isExpectedWebSocketDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+		return true
+	}
+	errText := err.Error()
+	return strings.Contains(errText, "broken pipe") ||
+		strings.Contains(errText, "connection reset by peer") ||
+		strings.Contains(errText, "websocket: close sent")
+}
+
+func (s *YapYap) RequireAdminMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID, exists := c.Get("user_id")
+		if !exists {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+			c.Abort()
+			return
+		}
+		if !s.HasGlobalFlag(userID.(uint64), models.PERM_ADMINISTRATOR) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
 }
 
 func NewYapYap(cfg *YapYapConfig) *YapYap {
@@ -201,13 +280,14 @@ func NewYapYap(cfg *YapYapConfig) *YapYap {
 	}
 
 	return &YapYap{
-		InstanceName: cfg.InstanceName,
-		Host:         cfg.Host,
-		Port:         cfg.Port,
-		JWTSecret:    []byte(cfg.JWTSecret),
-		Engine:       engine,
-		DB:           db,
-		Logger:       logger,
+		InstanceName:               cfg.InstanceName,
+		Host:                       cfg.Host,
+		Port:                       cfg.Port,
+		PermissionCacheSyncSeconds: cfg.PermissionCacheSyncSeconds,
+		JWTSecret:                  []byte(cfg.JWTSecret),
+		Engine:                     engine,
+		DB:                         db,
+		Logger:                     logger,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				// Configure CORS as needed
@@ -243,7 +323,9 @@ func (s *YapYap) HandleWebSocket(c *gin.Context) {
 	// Upgrade HTTP connection to WebSocket
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
+		if !isExpectedWebSocketDisconnect(err) {
+			log.Printf("WebSocket upgrade failed: %v", err)
+		}
 		return
 	}
 
@@ -302,7 +384,6 @@ func (s *YapYap) HandleWebSocket(c *gin.Context) {
 
 func (s *YapYap) handleClientRead(client *Client) {
 	defer func() {
-		log.Printf("Client %d disconnected", client.UserID)
 		s.removeClient(client)
 		client.Conn.Close()
 	}()
@@ -318,7 +399,7 @@ func (s *YapYap) handleClientRead(client *Client) {
 	for {
 		_, _, err := client.Conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			if !isExpectedWebSocketDisconnect(err) {
 				log.Printf("WebSocket error for user %d: %v", client.UserID, err)
 			}
 			break
@@ -340,19 +421,25 @@ func (s *YapYap) handleClientWrite(client *Client) {
 			client.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
 				// The send channel was closed
-				client.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				_ = client.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
 			if err := client.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				log.Printf("WebSocket write error for user %d: %v", client.UserID, err)
+				if !isExpectedWebSocketDisconnect(err) {
+					log.Printf("WebSocket write error for user %d: %v", client.UserID, err)
+				}
+				s.removeClient(client)
 				return
 			}
 
 		case <-ticker.C:
 			client.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := client.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("WebSocket ping error for user %d: %v", client.UserID, err)
+				if !isExpectedWebSocketDisconnect(err) {
+					log.Printf("WebSocket ping error for user %d: %v", client.UserID, err)
+				}
+				s.removeClient(client)
 				return
 			}
 		}
@@ -361,17 +448,21 @@ func (s *YapYap) handleClientWrite(client *Client) {
 
 // SyncPermissions loads all channel permissions for this user from DB into cache
 func (s *YapYap) SyncPermissions(client *Client) {
-	var perms []models.ChannelPermissions
-	err := s.DB.Where("user_id = ?", client.UserID).Find(&perms).Error
+	var channels []models.Channel
+	err := s.DB.Select("id").Find(&channels).Error
 	if err != nil {
 		log.Printf("Failed to sync permissions for user %d: %v", client.UserID, err)
 		return
 	}
-	client.permCacheMu.Lock()
-	client.PermCache = make(map[uint64]models.ChannelPermissions)
-	for _, p := range perms {
-		client.PermCache[p.ChannelID] = p
+
+	permCache := make(map[uint64]models.ChannelPermissions, len(channels))
+	for _, channel := range channels {
+		flags := s.ResolveChannelPermissions(client.UserID, channel.ID)
+		permCache[channel.ID] = channelPermissionsFromFlags(client.UserID, channel.ID, flags)
 	}
+
+	client.permCacheMu.Lock()
+	client.PermCache = permCache
 	client.permCacheMu.Unlock()
 }
 
@@ -1000,48 +1091,46 @@ func (s *YapYap) HandleUpdateChannelPermissions(c *gin.Context) {
 		return
 	}
 
-	var perm models.ChannelPermissions
-	err := s.DB.Where("user_id = ? AND channel_id = ?", permData.UserID, channelID).First(&perm).Error
+	chID := parseUint64(channelID)
+	var overwrite models.ChannelOverwrite
+	err := s.DB.Where("channel_id = ? AND target_type = ? AND target_id = ?", chID, models.OverwriteTargetMember, permData.UserID).First(&overwrite).Error
 	if err != nil {
-		// Create new permission if not found
-		perm = models.ChannelPermissions{
-			UserID:    permData.UserID,
-			ChannelID: parseUint64(channelID),
+		overwrite = models.ChannelOverwrite{
+			ChannelID:  chID,
+			TargetType: models.OverwriteTargetMember,
+			TargetID:   permData.UserID,
 		}
 	}
 
-	if permData.ViewChannel != nil {
-		perm.ViewChannel = *permData.ViewChannel
-	}
-	if permData.SendMessage != nil {
-		perm.SendMessage = *permData.SendMessage
-	}
-	if permData.SendAttachment != nil {
-		perm.SendAttachment = *permData.SendAttachment
-	}
-	if permData.ManageMessages != nil {
-		perm.ManageMessages = *permData.ManageMessages
-	}
-	if permData.ManageChannel != nil {
-		perm.ManageChannel = *permData.ManageChannel
+	applyBool := func(field *bool, flag uint64) {
+		if field == nil {
+			return
+		}
+		if *field {
+			overwrite.Allow |= flag
+			overwrite.Deny &^= flag
+			return
+		}
+		overwrite.Deny |= flag
+		overwrite.Allow &^= flag
 	}
 
-	if err := s.DB.Save(&perm).Error; err != nil {
+	applyBool(permData.ViewChannel, models.PERM_VIEW_CHANNEL)
+	applyBool(permData.SendMessage, models.PERM_SEND_MESSAGES)
+	applyBool(permData.SendAttachment, models.PERM_SEND_ATTACHMENTS)
+	applyBool(permData.ManageMessages, models.PERM_MANAGE_MESSAGES)
+	applyBool(permData.ManageChannel, models.PERM_MANAGE_CHANNELS)
+
+	if err := s.DB.Save(&overwrite).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update permissions"})
 		return
 	}
 
 	// Sync permissions for the affected user if they're connected
-	s.mu.RLock()
-	for _, client := range s.clients {
-		if client.UserID == permData.UserID {
-			s.SyncPermissions(client)
-			break
-		}
-	}
-	s.mu.RUnlock()
+	s.syncConnectedClientPermissions(permData.UserID)
 
-	c.JSON(http.StatusOK, perm)
+	flags := s.ResolveChannelPermissions(permData.UserID, chID)
+	c.JSON(http.StatusOK, channelPermissionsFromFlags(permData.UserID, chID, flags))
 }
 
 // Role Management Handlers
@@ -1158,6 +1247,8 @@ func (s *YapYap) HandleUpdateRole(c *gin.Context) {
 		return
 	}
 
+	s.syncUsersWithRolePermissions(role.ID)
+
 	c.JSON(http.StatusOK, role)
 }
 
@@ -1187,6 +1278,12 @@ func (s *YapYap) HandleDeleteRole(c *gin.Context) {
 		return
 	}
 
+	roleIDValue := parseUint64(roleID)
+	var assignedUsers []models.UserRole
+	if err := s.DB.Where("role_id = ?", roleID).Find(&assignedUsers).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load role assignments"})
+		return
+	}
 	// Delete all user role assignments first
 	if err := s.DB.Where("role_id = ?", roleID).Delete(&models.UserRole{}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove role assignments"})
@@ -1197,6 +1294,11 @@ func (s *YapYap) HandleDeleteRole(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete role"})
 		return
 	}
+
+	for _, assignedUser := range assignedUsers {
+		s.syncConnectedClientPermissions(assignedUser.UserID)
+	}
+	s.syncUsersWithRolePermissions(roleIDValue)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Role deleted"})
 }
@@ -1243,6 +1345,8 @@ func (s *YapYap) HandleAssignRole(c *gin.Context) {
 		return
 	}
 
+	s.syncConnectedClientPermissions(assignData.UserID)
+
 	c.JSON(http.StatusCreated, userRole)
 }
 
@@ -1280,6 +1384,8 @@ func (s *YapYap) HandleRemoveRole(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Role assignment not found"})
 		return
 	}
+
+	s.syncConnectedClientPermissions(removeData.UserID)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Role removed from user"})
 }
@@ -1554,8 +1660,7 @@ func (s *YapYap) BroadcastToChannel(channelID uint64, event ws.WebSocketEvent) {
 		return
 	}
 
-	s.mu.RLock()
-	for _, client := range s.clients {
+	for _, client := range s.snapshotClients() {
 		client.permCacheMu.RLock()
 		perm, ok := client.PermCache[channelID]
 		client.permCacheMu.RUnlock()
@@ -1569,7 +1674,6 @@ func (s *YapYap) BroadcastToChannel(channelID uint64, event ws.WebSocketEvent) {
 			}
 		}
 	}
-	s.mu.RUnlock()
 }
 
 func (s *YapYap) SetupRoutes() {
@@ -1589,7 +1693,7 @@ func (s *YapYap) SetupRoutes() {
 		api.GET("/voice/config", authHandlers.AuthMiddleware(s.JWTSecret), s.HandleVoiceConfig)
 
 		// Admin-only routes
-		admin := api.Group("/admin", authHandlers.AuthMiddleware(s.JWTSecret), authHandlers.RequireAdminMiddleware(s.DB))
+		admin := api.Group("/admin", authHandlers.AuthMiddleware(s.JWTSecret), s.RequireAdminMiddleware())
 		{
 			admin.POST("/users", authHandlers.CreateAdminHandler(s.DB, s.JWTSecret)) // Create admin user
 		}
@@ -1714,6 +1818,9 @@ func (s *YapYap) GracefullExit() {
 
 func (s *YapYap) Start() {
 	s.SetupRoutes()
+	if s.PermissionCacheSyncSeconds > 0 {
+		s.StartPermissionSyncer(s.PermissionCacheSyncSeconds)
+	}
 
 	// Log system startup
 	s.Logger.LogSystemEvent(models.LogLevelInfo, models.LogActionSystemStartup,
@@ -1749,26 +1856,28 @@ func (s *YapYap) Start() {
 
 // removeClient safely removes a client from the clients map
 func (s *YapYap) removeClient(client *Client) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	client.closeOnce.Do(func() {
+		s.mu.Lock()
+		_, exists := s.clients[client.Conn]
+		if exists {
+			delete(s.clients, client.Conn)
+		}
+		s.mu.Unlock()
 
-	if _, exists := s.clients[client.Conn]; exists {
-		// Log WebSocket disconnection
-		s.Logger.LogWithUser(models.LogLevelInfo, models.LogAction("websocket.disconnect"),
-			"User disconnected from WebSocket",
-			client.UserID, nil)
+		if exists {
+			log.Printf("Client %d disconnected", client.UserID)
+			s.Logger.LogWithUser(models.LogLevelInfo, models.LogAction("websocket.disconnect"),
+				"User disconnected from WebSocket",
+				client.UserID, nil)
+		}
 
-		delete(s.clients, client.Conn)
-		// Close the send channel safely
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Channel was already closed, ignore the panic
-				}
-			}()
-			close(client.Send)
+		defer func() {
+			if r := recover(); r != nil {
+				// Channel was already closed, ignore the panic
+			}
 		}()
-	}
+		close(client.Send)
+	})
 }
 
 // GetConnectedClientsCount returns the number of currently connected clients
@@ -1883,6 +1992,7 @@ func (s *YapYap) HandleUpsertChannelOverwrite(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create overwrite"})
 			return
 		}
+		s.syncConnectedClientPermissions(payload.TargetID)
 		c.JSON(http.StatusCreated, ow)
 		return
 	}
@@ -1894,6 +2004,7 @@ func (s *YapYap) HandleUpsertChannelOverwrite(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update overwrite"})
 		return
 	}
+	s.syncConnectedClientPermissions(payload.TargetID)
 	c.JSON(http.StatusOK, ow)
 }
 
@@ -1930,6 +2041,7 @@ func (s *YapYap) HandleDeleteChannelOverwrite(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Overwrite not found"})
 		return
 	}
+	s.syncConnectedClientPermissions(payload.TargetID)
 	c.JSON(http.StatusOK, gin.H{"message": "Overwrite deleted"})
 }
 
