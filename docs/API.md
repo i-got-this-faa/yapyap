@@ -80,6 +80,8 @@ Login with username and password to obtain a JWT token.
 #### POST /auth/register
 Register a new user account.
 
+Newly registered users automatically receive member-level access to all existing channels, including permission to view channels, send messages, and send attachments unless a later overwrite changes that access.
+
 **Request Body:**
 ```json
 {
@@ -164,21 +166,25 @@ All channel endpoints require authentication.
 #### GET /channels
 List all channels the authenticated user has access to.
 
+Channels are visible when the authenticated user has channel-level permission to view them. By default, newly created channels grant all existing users member-level access to view the channel, send messages, and send attachments.
+
 **Response (200 OK):**
 ```json
 [
   {
     "id": 1,
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z",
     "name": "general",
     "type": 0,
-    "created_at": "2025-01-01T00:00:00Z",
     "messages": []
   },
   {
     "id": 2,
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z",
     "name": "random",
     "type": 0,
-    "created_at": "2025-01-01T00:00:00Z",
     "messages": []
   }
 ]
@@ -193,6 +199,8 @@ List all channels the authenticated user has access to.
 #### POST /channels
 Create a new channel (requires admin or manage channels permission).
 
+When a channel is created, the server automatically creates member overwrites for all existing users so everyone currently in the app can immediately view the channel, send messages, and send attachments.
+
 **Request Body:**
 ```json
 {
@@ -205,9 +213,10 @@ Create a new channel (requires admin or manage channels permission).
 ```json
 {
   "id": 3,
+  "created_at": "2025-06-30T12:00:00Z",
+  "updated_at": "2025-06-30T12:00:00Z",
   "name": "new-channel",
   "type": 0,
-  "created_at": "2025-06-30T12:00:00Z",
   "messages": []
 }
 ```
@@ -219,9 +228,10 @@ Get a single channel by ID.
 ```json
 {
   "id": 1,
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-06-30T12:00:00Z",
   "name": "general",
   "type": 0,
-  "created_at": "2025-01-01T00:00:00Z",
   "messages": []
 }
 ```

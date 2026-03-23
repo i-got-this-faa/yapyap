@@ -21,7 +21,7 @@ type AuthRequest struct {
 }
 
 type AuthResponse struct {
-	UserID uint              `json:"user_id"`
+	UserID uint64            `json:"user_id"`
 	Token  string            `json:"token"`
 	User   yapyapModels.User `json:"user"`
 }
@@ -33,7 +33,7 @@ type RegisterRequest struct {
 }
 
 type Claims struct {
-	UserID   uint   `json:"user_id"`
+	UserID   uint64 `json:"user_id"`
 	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
@@ -50,7 +50,7 @@ func CheckPasswordHash(password, hash string) bool {
 }
 
 // GenerateJWT creates a new JWT token for a user
-func GenerateJWT(userID uint, username string, jwtSecret []byte) (string, error) {
+func GenerateJWT(userID uint64, username string, jwtSecret []byte) (string, error) {
 	claims := Claims{
 		UserID:   userID,
 		Username: username,
@@ -125,7 +125,7 @@ func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
 			return
 		}
 
-		c.Set("user_id", claims.UserID)
+		c.Set("user_id", uint64(claims.UserID))
 		c.Set("username", claims.Username)
 
 		c.Next()
@@ -222,6 +222,13 @@ func RegisterHandler(db *gorm.DB, jwtSecret []byte) gin.HandlerFunc {
 			return
 		}
 
+		if err := grantDefaultChannelAccess(db, uint64(newUser.ID)); err != nil {
+			db.Delete(&permissions)
+			db.Delete(&newUser)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to grant channel access"})
+			return
+		}
+
 		token, err := GenerateJWT(newUser.ID, newUser.Username, jwtSecret)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
@@ -236,18 +243,42 @@ func RegisterHandler(db *gorm.DB, jwtSecret []byte) gin.HandlerFunc {
 	}
 }
 
-// HandleGetCurrentUser handler - protected endpoint
-func HandleGetCurrentUser(c *gin.Context) {
-	username, _ := c.Get("username")
-	userID, _ := c.Get("user_id")
-	user := yapyapModels.User{
-		Model:      gorm.Model{ID: userID.(uint)},
-		Username:   username.(string),
-		Status:     yapyapModels.StatusActive,
-		LastActive: time.Now(),
-		Bio:        "Current authenticated user",
+// HandleGetCurrentUser returns the current authenticated user from the database.
+func HandleGetCurrentUser(db *gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID, _ := c.Get("user_id")
+
+		var user yapyapModels.User
+		if err := db.First(&user, userID.(uint64)).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+			return
+		}
+
+		c.JSON(http.StatusOK, user)
 	}
-	c.JSON(http.StatusOK, user)
+}
+
+func grantDefaultChannelAccess(db *gorm.DB, userID uint64) error {
+	var channels []yapyapModels.Channel
+	if err := db.Find(&channels).Error; err != nil {
+		return err
+	}
+	if len(channels) == 0 {
+		return nil
+	}
+
+	overwrites := make([]yapyapModels.ChannelOverwrite, 0, len(channels))
+	allow := yapyapModels.PERM_VIEW_CHANNEL | yapyapModels.PERM_SEND_MESSAGES | yapyapModels.PERM_SEND_ATTACHMENTS
+	for _, channel := range channels {
+		overwrites = append(overwrites, yapyapModels.ChannelOverwrite{
+			ChannelID:  channel.ID,
+			TargetType: yapyapModels.OverwriteTargetMember,
+			TargetID:   userID,
+			Allow:      allow,
+		})
+	}
+
+	return db.Create(&overwrites).Error
 }
 
 // AdminCreateRequest represents an admin user creation request
@@ -346,6 +377,13 @@ func CreateAdminHandler(db *gorm.DB, jwtSecret []byte) gin.HandlerFunc {
 			// If permissions creation fails, delete the user to maintain consistency
 			db.Delete(&newUser)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create admin permissions"})
+			return
+		}
+
+		if err := grantDefaultChannelAccess(db, uint64(newUser.ID)); err != nil {
+			db.Delete(&permissions)
+			db.Delete(&newUser)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to grant channel access"})
 			return
 		}
 

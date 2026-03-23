@@ -465,7 +465,33 @@ func (s *YapYap) HandleCreateChannel(c *gin.Context) {
 		CreatedAt: time.Now(),
 	}
 
-	if err := s.DB.Create(&channel).Error; err != nil {
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&channel).Error; err != nil {
+			return err
+		}
+
+		var users []models.User
+		if err := tx.Find(&users).Error; err != nil {
+			return err
+		}
+		if len(users) == 0 {
+			return nil
+		}
+
+		overwrites := make([]models.ChannelOverwrite, 0, len(users))
+		allow := models.PERM_VIEW_CHANNEL | models.PERM_SEND_MESSAGES | models.PERM_SEND_ATTACHMENTS
+		for _, user := range users {
+			overwrites = append(overwrites, models.ChannelOverwrite{
+				ChannelID:  channel.ID,
+				TargetType: models.OverwriteTargetMember,
+				TargetID:   uint64(user.ID),
+				Allow:      allow,
+			})
+		}
+
+		return tx.Create(&overwrites).Error
+	})
+	if err != nil {
 		// Log the error
 		s.Logger.LogWithUser(models.LogLevelError, models.LogActionChannelCreate,
 			fmt.Sprintf("Failed to create channel '%s': %v", chData.Name, err),
@@ -1559,7 +1585,7 @@ func (s *YapYap) SetupRoutes() {
 	{
 		api.POST("/auth/login", authHandlers.LoginHandler(s.DB, s.JWTSecret))
 		api.POST("/auth/register", authHandlers.RegisterHandler(s.DB, s.JWTSecret))
-		api.GET("/users/me", authHandlers.AuthMiddleware(s.JWTSecret), authHandlers.HandleGetCurrentUser)
+		api.GET("/users/me", authHandlers.AuthMiddleware(s.JWTSecret), authHandlers.HandleGetCurrentUser(s.DB))
 		api.GET("/voice/config", authHandlers.AuthMiddleware(s.JWTSecret), s.HandleVoiceConfig)
 
 		// Admin-only routes
